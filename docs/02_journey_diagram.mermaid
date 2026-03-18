@@ -1,0 +1,247 @@
+flowchart TD
+    classDef trigger fill:#DBEAFE,stroke:#2563EB,stroke-width:2px,color:#1E40AF
+    classDef email fill:#FEF3C7,stroke:#D97706,stroke-width:2px,color:#92400E
+    classDef emailTx fill:#E0F2FE,stroke:#0284C7,stroke-width:2px,color:#075985
+    classDef decision fill:#FCE7F3,stroke:#DB2777,stroke-width:2px,color:#9D174D
+    classDef state fill:#D1FAE5,stroke:#059669,stroke-width:2px,color:#065F46
+    classDef system fill:#F3E8FF,stroke:#7C3AED,stroke-width:2px,color:#5B21B6
+    classDef danger fill:#FEE2E2,stroke:#DC2626,stroke-width:2px,color:#991B1B
+
+    subgraph LEGEND[LEGEND]
+        direction LR
+        L1["Blue = Transactional, no unsub"]:::emailTx
+        L2["Yellow = Commercial, unsub required"]:::email
+        L3["Green = User state"]:::state
+        L4["Purple = System event"]:::system
+        L5["Pink = Decision"]:::decision
+    end
+
+    subgraph ARCH[SYSTEM ARCHITECTURE]
+        direction LR
+        A1["VAPI Webhooks"]:::trigger
+        A2["Stripe Webhooks"]:::trigger
+        A3["App Events"]:::trigger
+        A4["pg_cron Scheduler"]:::trigger
+        A1 --> A5["Backend API"]:::system
+        A2 --> A5
+        A3 --> A5
+        A4 --> A5
+        A5 --> A6["PostgreSQL + can_send_email gate + email_log dedup"]:::state
+        A6 --> A5
+        A5 --> A7["SendGrid API + Dynamic Templates + ASM Groups"]:::emailTx
+    end
+
+    subgraph P0[PHASE 0 - CART ABANDON]
+        direction TB
+        START(["Visitor lands on atty.ai"]):::trigger
+        START --> CLICK["Clicks Start Free Trial"]:::system
+        CLICK --> FORM["Enters email in signup form"]:::system
+        FORM --> D_FORM{"Completes signup?"}:::decision
+        D_FORM -->|Abandons| W_1H["Wait 1 hour via pg_cron"]:::system
+        W_1H --> E_CA1["cart_abandon_1: You left something behind - Unsub: Yes marketing"]:::email
+        E_CA1 --> W_24H["Wait 24 hours"]:::system
+        W_24H --> D_R1{"Returned?"}:::decision
+        D_R1 -->|No| E_CA2["cart_abandon_2: 67% wont leave voicemail - Unsub: Yes marketing"]:::email
+        E_CA2 --> W_3D["Wait 3 days"]:::system
+        W_3D --> D_R2{"Returned?"}:::decision
+        D_R2 -->|No| E_CA3["cart_abandon_3: Hear it in action demo FINAL - Unsub: Yes marketing"]:::email
+        E_CA3 --> COLD(["Cold nurture list END"]):::danger
+        D_R1 -->|Yes| ACCT
+        D_R2 -->|Yes| ACCT
+        D_FORM -->|Yes| ACCT
+    end
+
+    subgraph P1[PHASE 1 - ONBOARDING]
+        direction TB
+        ACCT["Account Created, 14-day trial starts"]:::state
+        ACCT --> E_WEL["welcome: 3 steps to go live - Trigger: INSERT users - Unsub: No"]:::emailTx
+        E_WEL --> PORTAL["User enters setup wizard"]:::system
+        PORTAL --> D_SET{"setup_completed_at IS NULL?"}:::decision
+        D_SET -->|NULL at 12h| T12["pg_cron hourly"]:::system
+        T12 --> E_N1["setup_nudge_1: 4 more minutes, progress checklist - Unsub: Yes onboarding"]:::email
+        E_N1 --> D1{"Done?"}:::decision
+        D1 -->|NULL at 36h| T24["pg_cron"]:::system
+        T24 --> E_N2["setup_nudge_2: Every missed call = missed client - Unsub: Yes onboarding"]:::email
+        E_N2 --> D2{"Done?"}:::decision
+        D2 -->|NULL at 3d| T48["pg_cron"]:::system
+        T48 --> E_N3["setup_nudge_3: Need a hand? Cal.com link - Unsub: Yes onboarding"]:::email
+        E_N3 --> D3{"Done?"}:::decision
+        D3 -->|NULL at 5d| T48B["pg_cron"]:::system
+        T48B --> E_N4["setup_nudge_final: Trial ticking, days left - Unsub: Yes onboarding"]:::email
+        E_N4 --> D4{"Done?"}:::decision
+        D4 -->|NULL Day 7+| MOUT(["Manual outreach flag"]):::danger
+        D_SET -->|NOT NULL| SDONE
+        D1 -->|Yes| SDONE
+        D2 -->|Yes| SDONE
+        D3 -->|Yes| SDONE
+        D4 -->|Yes| SDONE
+        SDONE["Setup Completed"]:::state
+        SDONE --> E_CONF["setup_complete: Youre live! Config summary - Trigger: UPDATE - Unsub: No"]:::emailTx
+        E_CONF --> D_TST{"Test call in 24h?"}:::decision
+        D_TST -->|No| E_TST["test_call_nudge: Have you tried it? 3 scenarios - Unsub: Yes onboarding"]:::email
+        D_TST -->|Yes| AREADY
+        E_TST --> AREADY
+        AREADY["AI Active, Waiting"]:::state
+    end
+
+    subgraph P2[PHASE 2 - ACTIVATION]
+        direction TB
+        AWAIT["Waiting for first call"]:::state
+        AWAIT --> D_FC{"First real call?"}:::decision
+        D_FC -->|Yes| E_FC["first_call: Your AI just answered! - Trigger: VAPI webhook - Unsub: No"]:::emailTx
+        D_FC -->|No at Day 7| E_NC["no_calls_troubleshoot: Is forwarding active? - Unsub: Yes onboarding"]:::email
+        E_FC --> ACTIVE
+        E_NC --> ACTIVE
+        ACTIVE["Active User"]:::state
+    end
+
+    subgraph P3[PHASE 3 - ACTIVE USAGE]
+        direction TB
+        AU["Active User, Ongoing"]:::state
+        AU --> D_NP{"call_notification_pref?"}:::decision
+        D_NP -->|realtime| E_CRT["call_notification: New message from caller - Trigger: VAPI - Unsub: No"]:::emailTx
+        D_NP -->|digest| E_DIG["daily_digest: Yesterday X calls - Trigger: pg_cron 8am - Unsub: No"]:::emailTx
+        D_NP -->|off| DONLY["Dashboard only"]:::system
+        AU --> D_VOL{"Weekly call count?"}:::decision
+        D_VOL -->|Under 20| E_WK["weekly_report: Calls + min + usage - Trigger: pg_cron Mon 8am - Unsub: Yes"]:::email
+        D_VOL -->|20+| E_DR["daily_report: Yesterday stats - Trigger: pg_cron 8am - Unsub: Yes"]:::email
+        AU --> DAY5["Trial Day 5"]:::system
+        DAY5 --> E_FE["feature_education: 3 things you havent tried - Unsub: Yes onboarding"]:::email
+    end
+
+    subgraph P4[PHASE 4 - TRIAL CONVERSION]
+        direction TB
+        TMON["Trial Timeline, pg_cron daily"]:::system
+        TMON --> TD11["trial_end_date minus 3 days"]:::system
+        TD11 --> E_T3["trial_ending_3days: Heres what youll lose - Unsub: Yes onboarding"]:::email
+        E_T3 --> TD13["trial_end_date minus 1 day"]:::system
+        TD13 --> E_T1["trial_ending_1day: AI goes offline tomorrow - Unsub: Yes onboarding"]:::email
+        E_T1 --> D_CV{"subscription_status = active?"}:::decision
+        D_CV -->|Yes| E_SB["subscription_confirmed: Youre all set - Trigger: Stripe webhook - Unsub: No"]:::emailTx
+        E_SB --> PAY
+        D_CV -->|Expired| E_EX["trial_expired: AI is offline, 90 day config save - Unsub: Yes onboarding"]:::email
+        E_EX --> WB_ENTRY
+        PAY["Paying Customer"]:::state
+    end
+
+    subgraph P5[PHASE 5 - BILLING AND CREDITS]
+        direction TB
+        PCUST["Paying Customer"]:::state
+        PCUST --> CMON["Credit Monitor, after each call updates"]:::system
+        CMON --> D_CR{"minutes_used vs plan_minutes?"}:::decision
+        D_CR -->|75%| E_C75["credit_warning_75: Heads up usage update - Unsub: No"]:::emailTx
+        D_CR -->|90%| E_C90["credit_warning_90: Running low - Unsub: No"]:::emailTx
+        D_CR -->|100%| E_C100["credit_limit_reached: All minutes used - Unsub: No"]:::emailTx
+        PCUST --> BCYC["Billing Cycle, Stripe webhooks"]:::system
+        BCYC --> E_REN["renewal_reminder: Plan renews in 7d - Trigger: pg_cron - Unsub: No"]:::emailTx
+        BCYC --> E_INV["monthly_invoice: Itemized usage summary - Trigger: Stripe invoice.paid - Unsub: No"]:::emailTx
+        BCYC --> D_PF{"Stripe invoice.payment_failed?"}:::decision
+        D_PF -->|attempt 1| E_PF1["payment_failed_1: Card declined, retry in 3d - Unsub: No"]:::emailTx
+        E_PF1 --> DR1{"Retry OK?"}:::decision
+        DR1 -->|attempt 2| E_PF2["payment_failed_2: Still failing, pauses in X days - Unsub: No"]:::emailTx
+        DR1 -->|invoice.paid| E_REC["payment_recovered: Payment processed - Unsub: No"]:::emailTx
+        E_PF2 --> DR2{"Retry OK?"}:::decision
+        DR2 -->|attempt 3| E_PF3["payment_failed_final: Service pauses tomorrow - Unsub: No"]:::emailTx
+        DR2 -->|invoice.paid| E_REC
+        E_PF3 --> DR3{"Resolved?"}:::decision
+        DR3 -->|No| E_SUS["service_suspended: AI offline, data preserved - Unsub: No"]:::emailTx
+        DR3 -->|invoice.paid| E_REC
+        E_SUS --> WB_ENTRY2
+        PCUST --> D_PL{"Stripe subscription.updated?"}:::decision
+        D_PL -->|Higher plan| E_UPG["plan_upgraded: New limits active now - Unsub: No"]:::emailTx
+        D_PL -->|Lower plan| E_DWN["plan_downgraded: New plan effective date - Unsub: No"]:::emailTx
+    end
+
+    subgraph P6[PHASE 6 - MILESTONES AND GROWTH]
+        direction TB
+        EMON["Milestone Tracker, after call updates total_calls"]:::system
+        EMON --> D_ML{"total_calls_all_time?"}:::decision
+        D_ML -->|100| E_M1["milestone_100: Impact stats + referral ask - Unsub: Yes marketing"]:::email
+        D_ML -->|500| E_M5["milestone_500: Power user stats - Unsub: Yes marketing"]:::email
+        D_ML -->|30 days paid| E_NPS["nps_survey: One question 0-10 - Trigger: pg_cron - Unsub: Yes marketing"]:::email
+        E_NPS --> D_NPS{"nps_score?"}:::decision
+        D_NPS -->|9-10| E_PRO["nps_promoter: Leave review + refer - Unsub: Yes marketing"]:::email
+        D_NPS -->|0-6| E_DET["nps_detractor: Lets fix this - Unsub: Yes marketing"]:::email
+        EMON --> D_UP{"High usage + 1 line?"}:::decision
+        D_UP -->|Yes 60d+| E_UPS["upsell_multiline: Add a second AI line - Unsub: Yes marketing"]:::email
+        EMON --> E_REF["referral_program: Give a month get a month - pg_cron at 60d - Unsub: Yes marketing"]:::email
+    end
+
+    subgraph P7[PHASE 7 - RETENTION]
+        direction TB
+        AMON["Activity Monitor, pg_cron daily"]:::system
+        AMON --> D_IN{"NOW minus last_call_at?"}:::decision
+        D_IN -->|7 days| E_I7["inactive_7days: Is forwarding active? - Unsub: Yes marketing"]:::email
+        E_I7 --> D14{"Still quiet?"}:::decision
+        D14 -->|14 days| E_I14["inactive_14days: Case study social proof - Unsub: Yes marketing"]:::email
+        E_I14 --> D21{"Still quiet?"}:::decision
+        D21 -->|21 days| E_I21["inactive_21days: Keep, Help, or Pause? - Unsub: Yes marketing"]:::email
+        E_I21 --> D28{"Response?"}:::decision
+        D28 -->|No 28 days| MFLAG(["Manual outreach flag"]):::danger
+    end
+
+    subgraph P8[PHASE 8 - CANCEL AND WINBACK]
+        direction TB
+        CINIT["User clicks Cancel, app event"]:::system
+        CINIT --> E_SUR["cancel_survey: Before you go, 6 reasons - Unsub: Yes marketing"]:::email
+        E_SUR --> D_RSN{"Cancel reason?"}:::decision
+        D_RSN -->|Price or Low usage| E_SAV["save_offer: 50% off for 2 months, 48h expiry - Unsub: Yes marketing"]:::email
+        D_RSN -->|Other| D_CFM{"Confirms cancel?"}:::decision
+        E_SAV --> D_CFM
+        D_CFM -->|Accepts offer| PRET(["Back to paying"]):::state
+        D_CFM -->|Cancels| E_CAN["cancel_confirmed: Service until billing end - Trigger: Stripe - Unsub: No"]:::emailTx
+        E_CAN --> WBK
+        WBK["Winback Entry"]:::danger
+        WBK --> WB14["pg_cron Day 14"]:::system
+        WB14 --> E_W1["winback_14days: Estimated missed calls - Unsub: Yes marketing"]:::email
+        E_W1 --> DW1{"Resubscribed?"}:::decision
+        DW1 -->|No| WB30["pg_cron Day 30"]:::system
+        WB30 --> E_W2["winback_30days: Whats new + 1 free week - Unsub: Yes marketing"]:::email
+        E_W2 --> DW2{"Resubscribed?"}:::decision
+        DW2 -->|No| WB90["pg_cron Day 90"]:::system
+        WB90 --> E_W3["winback_90days: Config deleted in 30d FINAL - Unsub: Yes marketing"]:::email
+        E_W3 --> WEND(["Archive contact END"]):::danger
+        DW1 -->|Yes| PRET
+        DW2 -->|Yes| PRET
+    end
+
+    subgraph P9[PHASE 9 - PRODUCT UPDATES]
+        direction TB
+        PTRIG["Product Team Ships, manual or API"]:::system
+        PTRIG --> D_UT{"Update type?"}:::decision
+        D_UT -->|New Feature| E_NF["new_feature: Feature announcement + CTA - Unsub: Yes product_updates"]:::email
+        D_UT -->|Monthly Changelog| E_CL["product_changelog: NEW, IMPROVED, FIXED tags - Unsub: Yes product_updates"]:::email
+        D_UT -->|Maintenance| E_MPR["maintenance_notice: Scheduled date time impact - Unsub: No"]:::emailTx
+        E_MPR --> E_MDN["maintenance_complete: All systems operational - Unsub: No"]:::emailTx
+    end
+
+    subgraph P10[ALWAYS-SEND TRANSACTIONAL]
+        direction LR
+        TX1["password_reset: User request, No unsub"]:::emailTx
+        TX2["email_change: User request, No unsub"]:::emailTx
+        TX3["security_alert: New device login, No unsub"]:::emailTx
+    end
+
+    AREADY --> AWAIT
+    ACTIVE --> AU
+    AU --> TMON
+    AU --> EMON
+    AU --> AMON
+    AU --> CINIT
+    PAY --> PCUST
+    PCUST --> EMON
+    PCUST --> AMON
+    PCUST --> CINIT
+    PCUST --> PTRIG
+    PRET --> PCUST
+    WB_ENTRY --> WBK
+    WB_ENTRY2 --> WBK
+
+    subgraph RULES[ANTI-OVERWHELM RULES via can_send_email]
+        direction LR
+        R1["Max 1 system email per day plus call notifications"]
+        R2["Priority: Payment=1, Trial=2, Credit=3, Report=6, Feature=7, Milestone=8"]
+        R3["Timezone aware: 8am-6pm local"]
+        R4["Dedup via email_log: cooldown_hours per template"]
+        R5["After final email in any sequence: STOP"]
+    end
